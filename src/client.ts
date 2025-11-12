@@ -132,11 +132,16 @@ export class CalDAVClient {
 
   private async tryDiscoveryRoots(): Promise<string> {
     try {
-      const wk = this.absolutize("/.well-known/caldav");
-      return await this.followRedirectOnce(wk);
-    } catch {
+      const discovered = await this.followRedirectOnce("/.well-known/caldav");
+      if (discovered && discovered !== "/.well-known/caldav") {
+        // Return relative path - it will be converted to absolute later
+        return discovered;
+      }
+    } catch (e) {
+      console.warn('[ts-caldav] Failed to discover via .well-known/caldav:', e);
       /* fall through */
     }
+
     const candidates = [
       "/",
       "/dav",
@@ -146,16 +151,15 @@ export class CalDAVClient {
     ];
     for (const p of candidates) {
       try {
-        const abs = this.absolutize(p);
         const res = await this.httpClient.request({
           method: "OPTIONS",
-          url: abs,
+          url: p,
           validateStatus: () => true,
         });
         const allow = String(res.headers["allow"] || "").toUpperCase();
         const dav = String(res.headers["dav"] || "").toLowerCase();
         const looksDav = allow.includes("PROPFIND") || dav.includes("1");
-        if (res.status < 500 && looksDav) return abs;
+        if (res.status < 500 && looksDav) return p;
       } catch {
         /* try next */
       }
@@ -1000,17 +1004,19 @@ export class CalDAVClient {
       const res = await this.httpClient.request({
         method: "GET",
         url,
-        maxRedirects: 0,
-        validateStatus: (s) => (s >= 200 && s < 300) || (s >= 300 && s < 400),
+        // Let axios follow redirects automatically (uses global maxRedirects setting)
+        validateStatus: (s) => s >= 200 && s < 300,
       });
-      if (res.status >= 300 && res.status < 400) {
-        const loc = res.headers["location"];
-        if (!loc) throw new Error(`Redirect without Location from ${url}`);
-        return this.absolutize(loc);
+      // res.request.responseURL contains the final URL after redirects
+      if (res.request?.responseURL) {
+        // Convert absolute URL back to relative path for consistency
+        const finalUrl = new URL(res.request.responseURL);
+        return finalUrl.pathname;
       }
       return url;
-    } catch {
-      return url;
+    } catch (e) {
+      console.warn(`[ts-caldav] followRedirectOnce failed for ${url}:`, e);
+      throw e;
     }
   }
 }
