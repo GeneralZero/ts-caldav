@@ -2,6 +2,7 @@ import axios, { AxiosInstance, AxiosRequestConfig } from "axios";
 import { XMLParser } from "fast-xml-parser";
 import ICAL from "ical.js";
 import { v4 as uuidv4 } from "uuid";
+import { Temporal } from 'temporal-polyfill';
 import {
   CalDAVClientCache,
   CalDAVOptions,
@@ -164,8 +165,8 @@ export class CalDAVClient {
       "/caldav.php",
       "/remote.php/dav",
     ];
-
-    for (const p of candidates) {
+    
+	for (const p of candidates) {
       try {
         const abs = this.absolutize(p);
         const res = await this.httpClient.request({
@@ -185,6 +186,7 @@ export class CalDAVClient {
       }
     }
 
+    // Fallback to baseUrl
     return this.baseUrl;
   }
 
@@ -278,7 +280,7 @@ export class CalDAVClient {
    */
   public async getEvents(
     calendarUrl: string,
-    options?: { start?: Date; end?: Date; all?: boolean },
+    options?: { start?: Date | Temporal.ZonedDateTime; end?: Date | Temporal.ZonedDateTime; all?: boolean }
   ): Promise<Event[]> {
     return this.getComponents<Event>(
       calendarUrl,
@@ -307,6 +309,53 @@ export class CalDAVClient {
   }
 
   /**
+   * Creates an event with a custom href (for RECURRENCE-ID events).
+   * This is used when creating single instance modifications of recurring events.
+   * @param calendarUrl - The URL of the calendar to create the event in.
+   * @param eventData - The event data with uid, href, and recurrenceId set.
+   * @returns The created event's metadata.
+   */
+  public async createEventWithCustomHref(
+    calendarUrl: string,
+    eventData: Event
+  ): Promise<{ uid: string; href: string; etag: string; newCtag: string }> {
+    if (!eventData.uid || !eventData.href) {
+      throw new Error("Both 'uid' and 'href' are required for custom href event creation.");
+    }
+
+    const base = normalizeSlashEnd(calendarUrl);
+    const ics = this.buildICSData(eventData, eventData.uid);
+
+    try {
+      // Use PUT without If-None-Match to create or update the event
+      // Accept 409 in case of conflicts and let the caller handle it
+      const response = await this.mkIcsPut(
+        eventData.href,
+        ics,
+        {},
+        (s) => s === 201 || s === 204 || s === 409
+      );
+
+      // If we got a 409, the server is rejecting due to a conflict
+      // This might mean we need to delete existing recurrence overrides first
+      if (response.status === 409) {
+        throw new Error("Event conflict (409): The server rejected this recurrence modification. There may be an existing override that needs to be deleted first.");
+      }
+
+      const etag = response.headers["etag"] || "";
+      const newCtag = await this.getCtag(base);
+      return { uid: eventData.uid, href: eventData.href, etag, newCtag };
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 409) {
+        // Get the response body for more details
+        const details = error.response?.data || "No details available";
+        throw new Error(`Event conflict (409): ${details}`);
+      }
+      throw new Error(`Failed to create event: ${error}`);
+    }
+  }
+
+  /**
    * Updates an existing event in the specified calendar.
    * @param calendarUrl - The URL of the calendar containing the event.
    * @param event - The event object with updated data.
@@ -332,6 +381,71 @@ export class CalDAVClient {
     return this.deleteItem(calendarUrl, eventUid, "event", etag);
   }
 
+  /**
+   * Adds a RECURRENCE-ID exception to an existing recurring event.
+   * This modifies the parent event's .ics file to include a new VEVENT component
+   * with the RECURRENCE-ID property, which is the proper way to handle single instance modifications.
+   * @param parentEvent - The parent recurring event
+   * @param exceptionEvent - The modified instance data with recurrenceId set
+   * @returns The updated event's metadata
+   */
+  public async addRecurrenceException(
+    parentEvent: Event,
+    exceptionEvent: Event
+  ): Promise<{ uid: string; href: string; etag: string; newCtag: string }> {
+    if (!parentEvent.href || !exceptionEvent.recurrenceId) {
+      throw new Error("Parent event must have href and exception must have recurrenceId");
+    }
+
+    // Fetch the raw ICS data for the parent event
+    const response = await this.httpClient.get(parentEvent.href, {
+      headers: { "Content-Type": "text/calendar" },
+    });
+
+    const icsData = response.data;
+
+    // Parse the ICS data
+    const jcalData = ICAL.parse(icsData);
+    const comp = new ICAL.Component(jcalData);
+    const vcalendar = comp.getFirstSubcomponent("vcalendar") || comp;
+
+    // Build the exception VEVENT component
+    const exceptionICS = this.buildICSData(exceptionEvent, exceptionEvent.uid);
+    const exceptionJcal = ICAL.parse(exceptionICS);
+    const exceptionComp = new ICAL.Component(exceptionJcal);
+    const exceptionVcal = exceptionComp.getFirstSubcomponent("vcalendar") || exceptionComp;
+    const exceptionVevent = exceptionVcal.getFirstSubcomponent("vevent");
+
+    if (!exceptionVevent) {
+      throw new Error("Failed to create exception VEVENT component");
+    }
+
+    // Add the exception VEVENT to the parent VCALENDAR
+    vcalendar.addSubcomponent(exceptionVevent);
+
+    // Convert back to ICS string
+    const updatedICS = vcalendar.toString();
+
+    // Update the parent event file with the modified ICS data
+    const base = normalizeSlashEnd(parentEvent.calendarId || "");
+    const putResponse = await this.mkIcsPut(
+      parentEvent.href,
+      updatedICS,
+      { "If-Match": parentEvent.etag },
+      (s) => s === 201 || s === 204
+    );
+
+    const etag = putResponse.headers["etag"] || "";
+    const newCtag = await this.getCtag(base);
+
+    return {
+      uid: parentEvent.uid,
+      href: parentEvent.href,
+      etag,
+      newCtag
+    };
+  }
+
   /*
    * Todo CRUD Operations
    */
@@ -344,7 +458,7 @@ export class CalDAVClient {
    */
   public async getTodos(
     calendarUrl: string,
-    options?: { start?: Date; end?: Date; all?: boolean },
+    options?: { start?: Date | Temporal.ZonedDateTime; end?: Date | Temporal.ZonedDateTime; all?: boolean }
   ): Promise<Todo[]> {
     return this.getComponents<Todo>(calendarUrl, "VTODO", parseTodos, {
       all: true,
@@ -565,11 +679,21 @@ export class CalDAVClient {
     calendarUrl: string,
     component: "VEVENT" | "VTODO",
     parseFn: (xml: string) => Promise<T[]>,
-    options?: { start?: Date; end?: Date; all?: boolean },
+    options?: { start?: Date | Temporal.ZonedDateTime; end?: Date | Temporal.ZonedDateTime; all?: boolean }
   ): Promise<T[]> {
-    const now = new Date();
-    const defaultEnd = new Date(now.getTime() + 3 * 7 * 24 * 60 * 60 * 1000);
-    const { start = now, end = defaultEnd, all } = options || {};
+    const now = Temporal.Now.zonedDateTimeISO();
+    const defaultEnd = now.add({ weeks: 3 });
+    let { start = now, end = defaultEnd, all } = options || {};
+
+    // Convert Date objects to Temporal for consistency (backward compatibility)
+    if (start instanceof Date) {
+      const instant = Temporal.Instant.fromEpochMilliseconds(start.getTime());
+      start = instant.toZonedDateTimeISO(Temporal.Now.timeZoneId());
+    }
+    if (end instanceof Date) {
+      const instant = Temporal.Instant.fromEpochMilliseconds(end.getTime());
+      end = instant.toZonedDateTimeISO(Temporal.Now.timeZoneId());
+    }
 
     const timeRangeFilter =
       start && end && !all
@@ -592,6 +716,16 @@ export class CalDAVClient {
           </c:comp-filter>
         </c:filter>
       </c:calendar-query>`;
+
+    console.log('[ts-caldav] getComponents request:', {
+      component,
+      start: start?.toString(),
+      end: end?.toString(),
+      formattedStart: start ? formatDate(start) : 'N/A',
+      formattedEnd: end ? formatDate(end) : 'N/A',
+      timeRangeFilter,
+      requestBody, // Log the full XML request
+    });
 
     try {
       const xml = await this.report(calendarUrl, requestBody, "1");
@@ -622,21 +756,24 @@ export class CalDAVClient {
     );
 
     if (event.wholeDay) {
-      const startDateStr = event.start.toISOString().split("T")[0];
+      const pad = (n: number): string => n.toString().padStart(2, '0');
+      const startDateStr = `${event.start.year}-${pad(event.start.month)}-${pad(event.start.day)}`;
       const endDateStr = event.end
-        ? event.end.toISOString().split("T")[0]
+        ? `${event.end.year}-${pad(event.end.month)}-${pad(event.end.day)}`
         : startDateStr;
 
-      const endExclusive = new Date(endDateStr + "T00:00:00Z");
-      endExclusive.setUTCDate(endExclusive.getUTCDate() + 1);
+      // For whole-day events, the end date is exclusive, so add 1 day
+      const endTemporal = event.end.add({ days: 1 });
+      const endDateExclusiveStr = `${endTemporal.year}-${pad(endTemporal.month)}-${pad(endTemporal.day)}`;
 
       e.startDate = ICAL.Time.fromDateString(startDateStr);
-      e.endDate = ICAL.Time.fromDateString(
-        endExclusive.toISOString().split("T")[0],
-      );
+      e.endDate = ICAL.Time.fromDateString(endDateExclusiveStr);
     } else {
-      const start = ICAL.Time.fromJSDate(event.start, true);
-      const end = ICAL.Time.fromJSDate(event.end, true);
+      // Convert Temporal to JS Date for ICAL.js
+      const startInstant = event.start.toInstant();
+      const endInstant = event.end.toInstant();
+      const start = ICAL.Time.fromJSDate(new Date(startInstant.epochMilliseconds), true);
+      const end = ICAL.Time.fromJSDate(new Date(endInstant.epochMilliseconds), true);
 
       if (event.startTzid) {
         const prop = vevent.addPropertyWithValue("dtstart", start);
@@ -657,6 +794,31 @@ export class CalDAVClient {
     e.description = event.description || "";
     e.location = event.location || "";
 
+    // Add RECURRENCE-ID for exception events
+    if (event.recurrenceId) {
+      if (event.wholeDay) {
+        // For whole-day events, use DATE format (no time component)
+        const pad = (n: number): string => n.toString().padStart(2, '0');
+        const recurrenceIdStr = `${event.recurrenceId.year}-${pad(event.recurrenceId.month)}-${pad(event.recurrenceId.day)}`;
+        const recurrenceIdDate = ICAL.Time.fromDateString(recurrenceIdStr);
+        vevent.addPropertyWithValue("recurrence-id", recurrenceIdDate);
+      } else {
+        // For timed events, use DATE-TIME format with UTC
+        const recurrenceIdInstant = event.recurrenceId.toInstant();
+        const recurrenceIdTime = ICAL.Time.fromJSDate(new Date(recurrenceIdInstant.epochMilliseconds), true);
+
+        // Check if we have timezone info
+        if (event.startTzid) {
+          // Add RECURRENCE-ID with TZID parameter to match DTSTART
+          const prop = vevent.addPropertyWithValue("recurrence-id", recurrenceIdTime);
+          prop.setParameter("tzid", event.startTzid);
+        } else {
+          // No timezone, use UTC
+          vevent.addPropertyWithValue("recurrence-id", recurrenceIdTime);
+        }
+      }
+    }
+
     if (event.recurrenceRule) {
       const r = event.recurrenceRule;
       const rruleProps: Record<string, string | number> = {};
@@ -665,20 +827,56 @@ export class CalDAVClient {
       if (r.count) rruleProps.COUNT = r.count;
       if (event.wholeDay && r.until) {
         rruleProps.UNTIL = ICAL.Time.fromDateString(
-          r.until.toISOString().split("T")[0],
+          r.until.toString().split("T")[0],
         ).toString();
       } else if (r.until) {
-        rruleProps.UNTIL = ICAL.Time.fromJSDate(r.until, true).toString();
+        const untilInstant = r.until.toInstant();
+        rruleProps.UNTIL = ICAL.Time.fromJSDate(new Date(untilInstant.epochMilliseconds), true).toString();
       }
 
       if (r.byday) rruleProps.BYDAY = r.byday.join(",");
       if (r.bymonthday) rruleProps.BYMONTHDAY = r.bymonthday.join(",");
       if (r.bymonth) rruleProps.BYMONTH = r.bymonth.join(",");
       vevent.addPropertyWithValue("rrule", rruleProps);
+
+      // Add EXDATE if present
+      if (r.exdate && r.exdate.length > 0) {
+        console.log('[ts-caldav client] Adding EXDATE to event:', r.exdate);
+        for (const exdateStr of r.exdate) {
+          // Parse the EXDATE string to determine if it's DATE or DATE-TIME
+          if (exdateStr.includes('T')) {
+            // DATE-TIME format: YYYYMMDDTHHmmssZ
+            const year = parseInt(exdateStr.substring(0, 4));
+            const month = parseInt(exdateStr.substring(4, 6));
+            const day = parseInt(exdateStr.substring(6, 8));
+            const hour = parseInt(exdateStr.substring(9, 11));
+            const minute = parseInt(exdateStr.substring(11, 13));
+            const second = parseInt(exdateStr.substring(13, 15));
+
+            const exdateTime = ICAL.Time.fromData({
+              year, month, day, hour, minute, second,
+              isDate: false
+            });
+            exdateTime.zone = ICAL.Timezone.utcTimezone;
+            vevent.addPropertyWithValue("exdate", exdateTime);
+          } else {
+            // DATE format: YYYYMMDD
+            const year = parseInt(exdateStr.substring(0, 4));
+            const month = parseInt(exdateStr.substring(4, 6));
+            const day = parseInt(exdateStr.substring(6, 8));
+
+            const exdateTime = ICAL.Time.fromData({
+              year, month, day,
+              isDate: true
+            });
+            vevent.addPropertyWithValue("exdate", exdateTime);
+          }
+        }
+      }
     }
 
     if (event.customFields) {
-      for (const [key, value] of Object.entries(event.customFields)) {
+      for (const [key, value] of Object.entries(event.customFields!)) {
         const values = Array.isArray(value) ? value : [value];
         for (const v of values) {
           vevent.addPropertyWithValue(key.toLowerCase(), v);
@@ -707,8 +905,41 @@ export class CalDAVClient {
       }
     }
 
+    // Encode ATTENDEE properties
+    if (event.attendees && event.attendees.length > 0) {
+      for (const attendee of event.attendees) {
+        const email = attendee.email.startsWith("mailto:")
+          ? attendee.email
+          : `mailto:${attendee.email}`;
+        const attendeeProp = vevent.addPropertyWithValue("attendee", email);
+
+        if (attendee.cn) {
+          attendeeProp.setParameter("cn", attendee.cn);
+        }
+        if (attendee.partstat) {
+          attendeeProp.setParameter("partstat", attendee.partstat);
+        }
+        if (attendee.role) {
+          attendeeProp.setParameter("role", attendee.role);
+        }
+        if (attendee.cutype) {
+          attendeeProp.setParameter("cutype", attendee.cutype);
+        }
+        if (attendee.rsvp !== undefined) {
+          attendeeProp.setParameter("rsvp", attendee.rsvp ? "TRUE" : "FALSE");
+        }
+      }
+    }
+
     vcalendar.addSubcomponent(vevent);
-    return vcalendar.toString();
+    const icsData = vcalendar.toString();
+
+    // Debug: Log the ICS data if it contains EXDATE
+    if (icsData.includes('EXDATE')) {
+      console.log('[ts-caldav buildICSData] Generated ICS with EXDATE:', icsData);
+    }
+
+    return icsData;
   }
 
   private buildTodoICSData(
@@ -726,18 +957,24 @@ export class CalDAVClient {
       ICAL.Time.fromJSDate(new Date(), true),
     );
 
-    if (todo.start)
+    if (todo.start) {
+      const startInstant = todo.start.toInstant();
       vtodo.addPropertyWithValue(
         "dtstart",
-        ICAL.Time.fromJSDate(todo.start, true),
+        ICAL.Time.fromJSDate(new Date(startInstant.epochMilliseconds), true),
       );
-    if (todo.due)
-      vtodo.addPropertyWithValue("due", ICAL.Time.fromJSDate(todo.due, true));
-    if (todo.completed)
+    }
+    if (todo.due) {
+      const dueInstant = todo.due.toInstant();
+      vtodo.addPropertyWithValue("due", ICAL.Time.fromJSDate(new Date(dueInstant.epochMilliseconds), true));
+    }
+    if (todo.completed) {
+      const completedInstant = todo.completed.toInstant();
       vtodo.addPropertyWithValue(
         "completed",
-        ICAL.Time.fromJSDate(todo.completed, true),
+        ICAL.Time.fromJSDate(new Date(completedInstant.epochMilliseconds), true),
       );
+    }
     vtodo.addPropertyWithValue("summary", todo.summary);
     if (todo.description)
       vtodo.addPropertyWithValue("description", todo.description);
@@ -747,7 +984,7 @@ export class CalDAVClient {
       vtodo.addPropertyWithValue("X-APPLE-SORT-ORDER", todo.sortOrder);
 
     if (todo.customFields) {
-      for (const [key, value] of Object.entries(todo.customFields)) {
+      for (const [key, value] of Object.entries(todo.customFields!)) {
         const values = Array.isArray(value) ? value : [value];
         for (const v of values) {
           vtodo.addPropertyWithValue(key.toLowerCase(), v);
@@ -883,7 +1120,7 @@ export class CalDAVClient {
     try {
       await this.httpClient.delete(href, {
         headers: { "If-Match": etag ?? "*" },
-        validateStatus: (s) => s === 204 || s === 200,
+        validateStatus: (s) => s === 200 || s === 204,
       });
     } catch (error) {
       throw new CalDAVError(
@@ -966,7 +1203,26 @@ export class CalDAVClient {
    */
 
   private absolutize(urlOrPath: string): string {
-    return new URL(urlOrPath, this.baseUrl).toString();
+    try {
+      // If it's already an absolute URL, extract just the path
+      const parsed = new URL(urlOrPath);
+      return parsed.pathname + parsed.search + parsed.hash;
+    } catch {
+      // It's a relative path, resolve it against baseUrl
+      const resolved = new URL(urlOrPath, this.baseUrl);
+      const fullPath = resolved.pathname + resolved.search + resolved.hash;
+
+      // If baseUrl has a path component and the resolved path starts with it,
+      // we may need to deduplicate (e.g., if baseUrl is https://example.com/dav
+      // and urlOrPath is /dav/.well-known, we don't want /dav/dav/.well-known)
+      const basePath = new URL(this.baseUrl).pathname;
+      if (basePath !== '/' && fullPath.startsWith(basePath + basePath)) {
+        // Remove the duplicate basePath
+        return fullPath.substring(basePath.length);
+      }
+
+      return fullPath;
+    }
   }
 
   private resolveUrl(path: string): string {
