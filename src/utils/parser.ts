@@ -12,6 +12,7 @@ import {
   TodoStatus,
 } from "../models";
 import ICAL from "ical.js";
+import { Temporal } from 'temporal-polyfill';
 
 const normalizeParam = (
   value: string | string[] | undefined
@@ -21,6 +22,36 @@ const normalizeParam = (
   }
   return value;
 };
+
+/**
+ * Converts an ICAL.Time object to Temporal.ZonedDateTime
+ */
+function icalTimeToTemporal(icalTime: ICAL.Time, tzid?: string): Temporal.ZonedDateTime {
+  // Get the timezone - use the provided tzid or the time's zone
+  let timezone = tzid || (icalTime.zone && icalTime.zone.tzid !== 'UTC' ? icalTime.zone.tzid : 'UTC');
+
+  // Debug: Log the timezone value to see what we're getting
+  if (timezone && typeof timezone === 'string' && timezone.includes('FLOAT')) {
+    console.log('[icalTimeToTemporal] Detected FLOATING timezone:', JSON.stringify(timezone), 'length:', timezone.length, 'trimmed:', timezone.trim());
+  }
+
+  // Handle special "FLOATING" timezone - treat as system local timezone
+  // Also handle variations like "FLOATING " (with space) or "floating"
+  const normalizedTz = timezone?.toString().trim().toUpperCase();
+  if (!timezone || normalizedTz === 'FLOATING') {
+    console.log('[icalTimeToTemporal] Converting FLOATING timezone to system timezone:', Temporal.Now.timeZoneId());
+    timezone = Temporal.Now.timeZoneId();
+  }
+
+  // Convert to JS Date first, then to Temporal
+  const jsDate = icalTime.toJSDate();
+
+  // Create PlainDateTime from the date components
+  const instant = Temporal.Instant.fromEpochMilliseconds(jsDate.getTime());
+
+  // Convert to ZonedDateTime in the appropriate timezone
+  return instant.toZonedDateTimeISO(timezone);
+}
 
 function parseRecurrence(recur: ICAL.Recur): RecurrenceRule {
   const freqMap = {
@@ -46,7 +77,7 @@ function parseRecurrence(recur: ICAL.Recur): RecurrenceRule {
     freq,
     interval: recur.interval,
     count: recur.count ? recur.count : undefined,
-    until: recur.until ? recur.until.toJSDate() : undefined,
+    until: recur.until ? icalTimeToTemporal(recur.until) : undefined,
     wkst,
     byday,
     bymonthday,
@@ -149,13 +180,16 @@ export const parseEvents = async (
         const dtEndProp = vevent.getFirstProperty("dtend");
 
         const isWholeDay = icalEvent.startDate.isDate;
-        const startDate = icalEvent.startDate.toJSDate();
-        const endDate = icalEvent.endDate?.toJSDate() ?? startDate;
-
-        const adjustedEnd = isWholeDay ? new Date(endDate.getTime()) : endDate;
 
         const startTzid = normalizeParam(dtStartProp?.getParameter("tzid"));
         const endTzid = normalizeParam(dtEndProp?.getParameter("tzid"));
+
+        const startDate = icalTimeToTemporal(icalEvent.startDate, startTzid);
+        const endDate = icalEvent.endDate
+          ? icalTimeToTemporal(icalEvent.endDate, endTzid)
+          : startDate;
+
+        const adjustedEnd = endDate;
 
         const rruleProp = vevent.getFirstProperty("rrule");
         let recurrenceRule: RecurrenceRule | undefined;
@@ -164,6 +198,59 @@ export const parseEvents = async (
           if (rruleValue) {
             const recur = ICAL.Recur.fromString(rruleValue.toString());
             recurrenceRule = parseRecurrence(recur);
+          }
+        }
+
+        // Parse EXDATE property (exception dates)
+        const exdateProps = vevent.getAllProperties("exdate");
+        if (exdateProps && exdateProps.length > 0 && recurrenceRule) {
+          const exdates: string[] = [];
+          console.log('[ts-caldav parser] Found EXDATE properties:', exdateProps.length, 'for event:', icalEvent.summary);
+          for (const exdateProp of exdateProps) {
+            const exdateValues = exdateProp.getValues();
+            if (exdateValues && Array.isArray(exdateValues)) {
+              for (const exdateValue of exdateValues) {
+                if (exdateValue) {
+                  // Convert ICAL.Time to Temporal
+                  const exdateTime = exdateValue as ICAL.Time;
+                  const exdateTemporal = icalTimeToTemporal(exdateTime);
+                  const pad = (n: number): string => n.toString().padStart(2, '0');
+
+                  // Format as YYYYMMDD or YYYYMMDDTHHmmssZ depending on whether it's a date or datetime
+                  if (exdateTime.isDate) {
+                    // DATE format: YYYYMMDD
+                    const year = exdateTemporal.year;
+                    const month = pad(exdateTemporal.month);
+                    const day = pad(exdateTemporal.day);
+                    exdates.push(`${year}${month}${day}`);
+                  } else {
+                    // DATE-TIME format: YYYYMMDDTHHmmssZ (in UTC)
+                    const utc = exdateTemporal.toInstant().toZonedDateTimeISO('UTC');
+                    const year = utc.year;
+                    const month = pad(utc.month);
+                    const day = pad(utc.day);
+                    const hour = pad(utc.hour);
+                    const minute = pad(utc.minute);
+                    const second = pad(utc.second);
+                    exdates.push(`${year}${month}${day}T${hour}${minute}${second}Z`);
+                  }
+                }
+              }
+            }
+          }
+          if (exdates.length > 0) {
+            recurrenceRule.exdate = exdates;
+            console.log('[ts-caldav parser] Parsed EXDATE values:', exdates, 'for event:', icalEvent.summary);
+          }
+        }
+
+        // Parse RECURRENCE-ID property
+        let recurrenceId: Temporal.ZonedDateTime | undefined;
+        const recurrenceIdProp = vevent.getFirstProperty("recurrence-id");
+        if (recurrenceIdProp) {
+          const recurrenceIdValue = recurrenceIdProp.getFirstValue() as ICAL.Time;
+          if (recurrenceIdValue) {
+            recurrenceId = icalTimeToTemporal(recurrenceIdValue, startTzid);
           }
         }
 
@@ -210,6 +297,37 @@ export const parseEvents = async (
           ? (rawStatus as EventStatus)
           : undefined;
 
+        // Parse ATTENDEE properties
+        const attendees: any[] = [];
+        let userPartstat: string | undefined;
+        const attendeeProps = vevent.getAllProperties("attendee") || [];
+
+        for (const attendeeProp of attendeeProps) {
+          const email = attendeeProp.getFirstValue()?.toString();
+          if (email) {
+            const cn = normalizeParam(attendeeProp.getParameter("cn"));
+            const partstat = normalizeParam(attendeeProp.getParameter("partstat"));
+            const role = normalizeParam(attendeeProp.getParameter("role"));
+            const cutype = normalizeParam(attendeeProp.getParameter("cutype"));
+            const rsvp = normalizeParam(attendeeProp.getParameter("rsvp"));
+
+            attendees.push({
+              email: email.replace(/^mailto:/i, ""),
+              cn: cn || undefined,
+              partstat: partstat || undefined,
+              role: role || undefined,
+              cutype: cutype || undefined,
+              rsvp: rsvp === "TRUE" ? true : undefined,
+            });
+
+            // For now, use the first PARTSTAT we find as the user's status
+            // In a full implementation, we'd match against the current user's email
+            if (partstat && !userPartstat) {
+              userPartstat = partstat;
+            }
+          }
+        }
+
         events.push({
           uid: icalEvent.uid,
           summary: icalEvent.summary || "Untitled Event",
@@ -224,9 +342,12 @@ export const parseEvents = async (
             : obj["href"],
           wholeDay: isWholeDay,
           recurrenceRule,
+          recurrenceId,
           startTzid,
           endTzid,
           alarms,
+          attendees: attendees.length > 0 ? attendees : undefined,
+          partstat: userPartstat as any,
         });
       }
     } catch (error) {
@@ -294,13 +415,13 @@ export const parseTodos = async (
         const completedProp = vtodo.getFirstProperty("completed");
 
         const start = dtStartProp
-          ? (dtStartProp.getFirstValue() as ICAL.Time).toJSDate()
+          ? icalTimeToTemporal(dtStartProp.getFirstValue() as ICAL.Time)
           : undefined;
         const due = dueProp
-          ? (dueProp.getFirstValue() as ICAL.Time).toJSDate()
+          ? icalTimeToTemporal(dueProp.getFirstValue() as ICAL.Time)
           : undefined;
         const completed = completedProp
-          ? (completedProp.getFirstValue() as ICAL.Time).toJSDate()
+          ? icalTimeToTemporal(completedProp.getFirstValue() as ICAL.Time)
           : undefined;
 
         const alarms: Alarm[] = [];

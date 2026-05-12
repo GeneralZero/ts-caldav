@@ -1,10 +1,10 @@
 {
   "compilerOptions": {
     "target": "ES2019",
-    "module": "CommonJS",
-    "strict": true,
+    "module": "ESNext",
+    "strict": false,
     "resolveJsonModule": true,
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "lib": ["ES2019", "dom"],
     "declaration": true,
     "isolatedModules": true,

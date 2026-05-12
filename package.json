@@ -1,7 +1,8 @@
 {
   "name": "ts-caldav",
-  "version": "0.2.7",
+  "version": "0.2.8-exdate",
   "description": "A CalDAV client written in TypeScript",
+  "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -27,6 +28,7 @@
     "dotenv": "^16.4.7",
     "fast-xml-parser": "^4.5.1",
     "ical.js": "^2.1.0",
+    "temporal-polyfill": "^0.3.0",
     "uuid": "^11.1.0"
   },
   "devDependencies": {
